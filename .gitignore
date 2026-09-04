@@ -11,3 +11,8 @@ __pycache__/
 *.pyc
 crash-analysis-report/
 *.ips
+
+# Local/CI decrypted input and build outputs must never be committed.
+/Payload/
+/YouTube.zip
+/deliverables/
