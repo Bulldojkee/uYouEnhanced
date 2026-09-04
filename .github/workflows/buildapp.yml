@@ -17,7 +17,7 @@ on:
         required: true
         type: string
       decrypted_youtube_url:
-        description: "Direct URL of the decrypted YouTube IPA"
+        description: "Direct HTTPS IPA URL or this repository's release asset API URL"
         default: ""
         required: true
         type: string
@@ -178,7 +178,7 @@ jobs:
           wget --quiet "https://github.com/inoahdev/tbd/releases/download/2.2/tbd-mac" -O /usr/local/bin/tbd
           chmod +x /usr/local/bin/tbd
 
-      - name: Hash YT ipa url
+      - name: Mask source IPA URL
         run: |
           URL_YT="$(jq -r '.inputs.decrypted_youtube_url' $GITHUB_EVENT_PATH)"
           echo "::add-mask::$URL_YT"
@@ -186,12 +186,23 @@ jobs:
 
       - name: Prepare and validate decrypted YouTube IPA
         id: prepare_youtube
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           INPUT_IPA="$RUNNER_TEMP/youtube-source.ipa"
-          curl --fail --location --silent --show-error --retry 3 --proto '=https' --proto-redir '=https' "$URL_YT" --output "$INPUT_IPA"
-          python3 main/Scripts/ipa_preflight.py "$INPUT_IPA" --mode input --expected-version "$EXPECTED_YOUTUBE_VERSION" --max-ios 18.5 --manifest "$RUNNER_TEMP/input-manifest.json"
+          ASSET_PREFIX="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/assets/"
+          if [[ "$URL_YT" == "$ASSET_PREFIX"* ]]; then
+            ASSET_ID="${URL_YT#"$ASSET_PREFIX"}"
+            [[ "$ASSET_ID" =~ ^[0-9]+$ ]] || { echo 'Invalid release asset ID'; exit 1; }
+            gh api --hostname github.com -H 'Accept: application/octet-stream' \
+              "repos/${GITHUB_REPOSITORY}/releases/assets/${ASSET_ID}" > "$INPUT_IPA"
+          else
+            curl --fail --location --silent --show-error --retry 3 --proto '=https' --proto-redir '=https' "$URL_YT" --output "$INPUT_IPA"
+          fi
+          BUILD_IPA="$RUNNER_TEMP/youtube-build-input.ipa"
+          python3 main/Scripts/prepare_youtube_input.py "$INPUT_IPA" "$BUILD_IPA" --expected-version "$EXPECTED_YOUTUBE_VERSION" --max-ios 18.5 --manifest "$RUNNER_TEMP/input-manifest.json"
           mkdir -p "$RUNNER_TEMP/youtube-input"
-          unzip -q "$INPUT_IPA" 'Payload/*' -d "$RUNNER_TEMP/youtube-input"
+          unzip -q "$BUILD_IPA" 'Payload/*' -d "$RUNNER_TEMP/youtube-input"
           mv "$RUNNER_TEMP/youtube-input/Payload" main/Payload
           test -f main/Payload/YouTube.app/Info.plist
           echo "YT_VERSION=$EXPECTED_YOUTUBE_VERSION" >> "$GITHUB_ENV"
@@ -448,5 +459,5 @@ jobs:
       - name: Remove source download and extracted application from runner
         if: always()
         run: |
-          rm -f "$RUNNER_TEMP/youtube-source.ipa" "$RUNNER_TEMP/input-manifest.json"
+          rm -f "$RUNNER_TEMP/youtube-source.ipa" "$RUNNER_TEMP/youtube-build-input.ipa" "$RUNNER_TEMP/input-manifest.json"
           rm -rf -- "$GITHUB_WORKSPACE/main/Payload" "$RUNNER_TEMP/youtube-input"

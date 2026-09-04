@@ -53,12 +53,21 @@ fork already has `buildapp.yml` there.
 Provide a direct HTTPS download URL for your decrypted YouTube 21.14.4 IPA and
 the confirmed `bundle_id`. Keep `sdk_version=18.6`, `uyou_version=3.0.4`,
 `sponsorblock=true`, `ytuhd=false`, `upload_artifact=true`, and
-`create_release=false`. The URL must work without an interactive login from
-GitHub's runner. An IPA supplied only as a local attachment must first be made
-available to the runner; no upload destination is assumed or created here.
+`create_release=false`. The URL must be readable by GitHub's runner. A local
+IPA can be attached to an unpublished draft release in this same fork; pass
+its API URL in the form
+`https://api.github.com/repos/Bulldojkee/uYouEnhanced/releases/assets/ASSET_ID`.
+The workflow authenticates that exact repository asset endpoint with its job
+token, without sending the token to arbitrary download URLs. Do not publish
+the input draft release. Direct HTTPS download URLs remain supported.
 
-Only `Payload/*` is extracted into a temporary directory after ZIP and Mach-O
-validation. The source download stays under `RUNNER_TEMP`. Only the final
+The input preparation script validates ZIP paths, copies the archive without
+`Payload/<app>.app/Extensions/`, and strictly validates all remaining Mach-O
+files. These ExtensionKit bundles are already excluded by upstream for
+resigning; removing them before encryption validation avoids rejecting an
+otherwise decrypted main app. This does not decrypt any executable or weaken
+final IPA validation. Only `Payload/*` is extracted into a temporary directory
+after validation. The source download stays under `RUNNER_TEMP`. Only the final
 validated IPA and build metadata enter the artifact. `.ipa`, `Payload/`, and
 the historical `YouTube.zip` intermediate are excluded from Git. The workflow
 contains no `git add`, commit, or push step. Masking the URL in step logs does
@@ -122,9 +131,12 @@ saved settings.
 
 ## Local validation
 
-Run `python3 -m unittest discover -s Scripts -p test_ipa_preflight.py`.
-Thirty synthetic-IPA tests passed during preparation. The workflow also passed
+Run `python3 -m unittest discover -s Scripts -p 'test_*.py'`.
+Thirty-four synthetic-IPA tests passed during preparation. The workflow also passed
 actionlint 1.7.12 without optional shellcheck/pyflakes integrations; Bash syntax
-and embedded Python blocks were checked separately. No real input IPA or
-confirmed old bundle ID was available, so native compilation, installation,
-and iPhone runtime checks remain pending.
+and embedded Python blocks were checked separately. The supplied real YouTube
+21.14.4 IPA passed input checks after removing its encrypted AppMigrationExtension
+from a separate build copy; its main executable and all seven retained Mach-O
+files are unencrypted. The original file was not modified. The old installation
+bundle ID still needs confirmation. Native compilation, installation, and
+iPhone runtime checks remain pending.
