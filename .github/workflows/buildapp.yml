@@ -1,14 +1,14 @@
 # Original idea by @ISnackable. Thanks to him for handling the hardest parts!
 # https://github.com/ISnackable/YTCubePlus/blob/main/.github/workflows/Build.yml
 
-name: Build and Release uYouEnhanced
+name: Build uYouEnhanced for AltStore
 
 on:
   workflow_dispatch:
     inputs:
       sdk_version:
         description: "iOS SDK Version"
-        default: "17.5"
+        default: "18.6"
         required: true
         type: string
       uyou_version:
@@ -17,13 +17,13 @@ on:
         required: true
         type: string
       decrypted_youtube_url:
-        description: "Direct URL of the decrypted YouTube IPA"
+        description: "Direct HTTPS IPA URL or this repository's release asset API URL"
         default: ""
         required: true
         type: string
       bundle_id:
-        description: "Modify the bundle ID"
-        default: "com.google.ios.youtube"
+        description: "Original bundle ID of your existing IPA (required; no guessed default)"
+        default: ""
         required: true
         type: string
       app_name:
@@ -31,22 +31,27 @@ on:
         default: "YouTube"
         required: true
         type: string
-      commit_id:
-        description: "(Optional) Commit ID to build at"
-        default: ""
-        required: false
-        type: string
       upload_artifact:
-        description: "Upload IPA as artifact"
-        default: false
-        required: false
-        type: boolean
-      create_release:
-        description: "Create a draft release"
+        description: "Upload validated IPA as artifact"
         default: true
         required: false
         type: boolean
-  
+      create_release:
+        description: "Create a draft release (optional)"
+        default: false
+        required: false
+        type: boolean
+      ytuhd:
+        description: "Include YTUHD"
+        default: false
+        required: false
+        type: boolean
+      sponsorblock:
+        description: "Include iSponsorBlock (requires on-device compatibility testing)"
+        default: true
+        required: false
+        type: boolean
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -54,122 +59,393 @@ concurrency:
 jobs:
   build:
     name: Build uYouEnhanced
-    runs-on: macos-13
+    runs-on: macos-15-intel
     permissions:
       contents: write
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      THEOS: ${{ github.workspace }}/theos
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+      SDK_VERSION: ${{ inputs.sdk_version }}
+      UYOU_VERSION: ${{ inputs.uyou_version }}
+      TARGET_BUNDLE_ID: ${{ inputs.bundle_id }}
+      APP_NAME: ${{ inputs.app_name }}
+      EXPECTED_YOUTUBE_VERSION: "21.14.4"
+      SPONSORBLOCK_ENABLED: ${{ inputs.sponsorblock && '1' || '0' }}
+      YTUHD_ENABLED: ${{ inputs.ytuhd && '1' || '0' }}
 
     steps:
+      - name: Validate build inputs
+        env:
+          IPA_URL: ${{ inputs.decrypted_youtube_url }}
+          UPLOAD_ARTIFACT: ${{ inputs.upload_artifact }}
+          CREATE_RELEASE: ${{ inputs.create_release }}
+        run: |
+          python3 - <<'PY'
+          import os, re, urllib.parse
+          def require(ok, message):
+              if not ok:
+                  raise SystemExit(message)
+          require(re.fullmatch(r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+", os.environ["TARGET_BUNDLE_ID"]), "Provide the confirmed original bundle ID; no default is assumed.")
+          require(os.environ["SDK_VERSION"] == "18.6", "This build profile was prepared for iOS SDK 18.6.")
+          require(os.environ["UYOU_VERSION"] == "3.0.4", "The upstream patches require the 3.0.4 base (rebranded upstream as unofficial 3.0.5).")
+          require(re.fullmatch(r"[A-Za-z0-9 _.-]{1,60}", os.environ["APP_NAME"]), "Use a simple application display name.")
+          url = urllib.parse.urlsplit(os.environ["IPA_URL"])
+          require(url.scheme == "https" and url.netloc and not any(c in os.environ["IPA_URL"] for c in "\r\n"), "Provide a direct HTTPS IPA URL.")
+          require(os.environ["UPLOAD_ARTIFACT"] == "true" or os.environ["CREATE_RELEASE"] == "true", "Enable at least one output destination.")
+          PY
+
       - name: Checkout Main
-        uses: actions/checkout@v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: main
-          ref: ${{ github.event.inputs.commit_id || github.ref }}
+          ref: ${{ github.sha }}
+          persist-credentials: false
           submodules: recursive
 
       - name: Install Dependencies
-        run: brew install ldid dpkg make
+        run: |
+          brew install ldid dpkg make wget unzip jq pipx
 
-      - name: Set PATH environment variable
-        run: echo "$(brew --prefix make)/libexec/gnubin" >> $GITHUB_PATH 
+      - name: Set PATH
+        run: echo "$(brew --prefix make)/libexec/gnubin" >> $GITHUB_PATH
 
       - name: Setup Theos
-        uses: actions/checkout@v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: theos/theos
-          ref: master
+          ref: 5280bd038207e14f8bd76f5417aa2fe641c03228
           path: theos
+          persist-credentials: false
           submodules: recursive
-      
+
       - name: SDK Caching
         id: SDK
-        uses: actions/cache@v4.2.3
-        env:
-          cache-name: iOS-${{ inputs.sdk_version }}-SDK
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: theos/sdks/
-          key: ${{ env.cache-name }}
-          restore-keys: ${{ env.cache-name }}
+          key: macos-intel-iOS-${{ inputs.sdk_version }}-SDK-1b92ff4
 
       - name: Download iOS SDK
         if: steps.SDK.outputs.cache-hit != 'true'
         run: |
-          git clone --quiet -n --depth=1 --filter=tree:0 https://github.com/aricloverALT/sdks/
+          git init -q sdks
           cd sdks
-          git sparse-checkout set --no-cone iPhoneOS${{ inputs.sdk_version }}.sdk
-          git checkout
-          mv *.sdk $THEOS/sdks
+          git remote add origin https://github.com/aricloverALT/sdks.git
+          git sparse-checkout set --no-cone "iPhoneOS${SDK_VERSION}.sdk"
+          git fetch --quiet --depth=1 --filter=tree:0 origin 1b92ff4a8928f582876e1d388d1381c6a0c59eb9
+          git checkout --quiet --detach FETCH_HEAD
+          mkdir -p "$THEOS/sdks"
+          mv "iPhoneOS${SDK_VERSION}.sdk" "$THEOS/sdks/"
         env:
           THEOS: ${{ github.workspace }}/theos
 
       - name: Setup Theos Jailed
-        uses: actions/checkout@v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: qnblackcat/theos-jailed
-          ref: master
+          ref: 662fd704aed27b8956bcfe52a35e2b676921ab42
           path: theos-jailed
-          submodules: recursive
+          persist-credentials: false
 
       - name: Install Theos Jailed
-        run: |
-          ./theos-jailed/install
+        run: ./theos-jailed/install
         env:
           THEOS: ${{ github.workspace }}/theos
 
-      - name: Hash YT ipa url
+      - name: Fix Theos broken pipe issue
+        run: |
+          find "$THEOS" -name "*.sh" -type f | while read -r SCRIPT; do
+            if grep -q '| head' "$SCRIPT" 2>/dev/null; then
+              sed -i '' 's/| head/2>\/dev\/null | head/g' "$SCRIPT" 2>/dev/null || true
+              echo "Patched: $SCRIPT"
+            fi
+          done
+          find "$THEOS" -name "*.mk" -type f | while read -r MK; do
+            if grep -q '| head' "$MK" 2>/dev/null; then
+              sed -i '' 's/| head/2>\/dev\/null | head/g' "$MK" 2>/dev/null || true
+              echo "Patched: $MK"
+            fi
+          done
+          echo "Broken pipe fixes applied"
+
+      - name: Install cyan and tbd
+        run: |
+          pipx install https://github.com/asdfzxcvbn/pyzule-rw/archive/740d3716dcd98c20c000f12cdb88f1f0b2a533a4.zip
+          wget --quiet "https://github.com/inoahdev/tbd/releases/download/2.2/tbd-mac" -O /usr/local/bin/tbd
+          chmod +x /usr/local/bin/tbd
+
+      - name: Mask source IPA URL
         run: |
           URL_YT="$(jq -r '.inputs.decrypted_youtube_url' $GITHUB_EVENT_PATH)"
-          echo ::add-mask::$URL_YT
-          echo URL_YT=$URL_YT >> $GITHUB_ENV
+          echo "::add-mask::$URL_YT"
+          echo "URL_YT=$URL_YT" >> "$GITHUB_ENV"
 
-      - name: Prepare YouTube iPA
+      - name: Prepare and validate decrypted YouTube IPA
         id: prepare_youtube
-        run: |
-          wget "$YOUTUBE_URL" --quiet --no-verbose -O main/YouTube.ipa
-          cd ${{ github.workspace }}/main
-          mv YouTube.ipa YouTube.zip
-          unzip -q YouTube.zip
-          youtube_version=$(defaults read "$(pwd)/Payload/YouTube.app/Info" CFBundleVersion)
-          echo "==> YouTube v$youtube_version downloaded!"
-          sed -i '' "17s#.*#YOUTUBE_VERSION = ${youtube_version}#g" Makefile
-          echo "youtube_version=${youtube_version}" >> $GITHUB_OUTPUT
-
         env:
-          THEOS: ${{ github.workspace }}/theos
-          YOUTUBE_URL: ${{ env.URL_YT }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          INPUT_IPA="$RUNNER_TEMP/youtube-source.ipa"
+          ASSET_PREFIX="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/assets/"
+          if [[ "$URL_YT" == "$ASSET_PREFIX"* ]]; then
+            ASSET_ID="${URL_YT#"$ASSET_PREFIX"}"
+            [[ "$ASSET_ID" =~ ^[0-9]+$ ]] || { echo 'Invalid release asset ID'; exit 1; }
+            gh api --hostname github.com -H 'Accept: application/octet-stream' \
+              "repos/${GITHUB_REPOSITORY}/releases/assets/${ASSET_ID}" > "$INPUT_IPA"
+          else
+            curl --fail --location --silent --show-error --retry 3 --proto '=https' --proto-redir '=https' "$URL_YT" --output "$INPUT_IPA"
+          fi
+          BUILD_IPA="$RUNNER_TEMP/youtube-build-input.ipa"
+          python3 main/Scripts/prepare_youtube_input.py "$INPUT_IPA" "$BUILD_IPA" --expected-version "$EXPECTED_YOUTUBE_VERSION" --max-ios 18.5 --manifest "$RUNNER_TEMP/input-manifest.json"
+          mkdir -p "$RUNNER_TEMP/youtube-input"
+          unzip -q "$BUILD_IPA" 'Payload/*' -d "$RUNNER_TEMP/youtube-input"
+          mv "$RUNNER_TEMP/youtube-input/Payload" main/Payload
+          test -f main/Payload/YouTube.app/Info.plist
+          echo "YT_VERSION=$EXPECTED_YOUTUBE_VERSION" >> "$GITHUB_ENV"
+          echo "youtube_version=$EXPECTED_YOUTUBE_VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Fix compiling & Build Package
+      - name: Build package with explicit application identity
         id: build_package
+        working-directory: main
         run: |
-          cd ${{ github.workspace }}/main
-          sed -i '' "30s#.*#BUNDLE_ID = ${{ env.BUNDLE_ID }}#g" Makefile                          # Modify the bundle ID
-          sed -i '' "29s#.*#DISPLAY_NAME = ${{ env.APP_NAME }}#g" Makefile                        # Modify the app name
-          sed -i '' "1s#.*#export TARGET = iphone:clang:${{ inputs.sdk_version }}:14.0#g" Makefile # Modify the SDK version
-          make package THEOS_PACKAGE_SCHEME=rootless IPA=Payload/YouTube.app FINALPACKAGE=1
-          echo "package=$(ls -t packages | head -n1)" >>$GITHUB_OUTPUT
-          echo -e "==> \033[1mSHASUM256: $(shasum -a 256 packages/*.ipa | cut -f1 -d' ')\033[0m"
-          echo -e "==> \033[1mBundle ID: ${{ env.BUNDLE_ID }}\033[0m"
+          make package THEOS_PACKAGE_SCHEME=rootless IPA=Payload/YouTube.app FINALPACKAGE=1 \
+            SDK_VERSION="$SDK_VERSION" TARGET="iphone:clang:${SDK_VERSION}:16.0" \
+            BUNDLE_ID="$TARGET_BUNDLE_ID" DISPLAY_NAME="$APP_NAME" \
+            YOUTUBE_VERSION="$EXPECTED_YOUTUBE_VERSION" UYOU_VERSION="$UYOU_VERSION" \
+            YTUHD_ENABLED="$YTUHD_ENABLED" SPONSORBLOCK_ENABLED="$SPONSORBLOCK_ENABLED"
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          packages = list(Path("packages").glob("*.ipa"))
+          if len(packages) != 1:
+              raise SystemExit(f"Expected exactly one built IPA, found {len(packages)}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              print(f"package={packages[0].name}", file=output)
+          PY
 
-        env:
-          THEOS: ${{ github.workspace }}/theos
-          UYOU_VERSION: ${{ inputs.uyou_version }}
-          BUNDLE_ID: ${{ inputs.bundle_id }}
-          APP_NAME: ${{ inputs.app_name }}
+      - name: Clone Open in YouTube (Safari Extension)
+        run: |
+          git init -q OpenYouTubeSafariExtension
+          cd OpenYouTubeSafariExtension
+          git remote add origin https://github.com/BillyCurtis/OpenYouTubeSafariExtension.git
+          git sparse-checkout set --no-cone OpenYouTubeSafariExtension.appex
+          git fetch --quiet --depth=1 --filter=tree:0 origin c87b5d5551b406477dca883158572f803251f52c
+          git checkout --quiet --detach FETCH_HEAD
+          mv *.appex ..
+
+      - name: Normalize Extension Bundle ID for SideStore
+        run: |
+          set -euo pipefail
+
+          PARENT_BUNDLE="$TARGET_BUNDLE_ID"
+          ORIG_PREFIX="com.google.ios.youtube"
+
+          echo "Normalizing extension CFBundleIdentifier(s) to use parent prefix: ${PARENT_BUNDLE}"
+
+          update_plist_id() {
+            PLIST_PATH="$1"
+            if [ ! -f "$PLIST_PATH" ]; then
+              return
+            fi
+            if /usr/bin/plutil -convert xml1 "$PLIST_PATH" >/dev/null 2>&1; then
+              :
+            fi
+            CURRENT_ID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$PLIST_PATH" 2>/dev/null || true)
+            if [ -z "$CURRENT_ID" ]; then
+              return
+            fi
+            if [[ "$CURRENT_ID" == "$ORIG_PREFIX"* ]]; then
+              SUFFIX="${CURRENT_ID#${ORIG_PREFIX}.}"
+              if [ "$SUFFIX" = "$CURRENT_ID" ]; then
+                SUFFIX="Extension"
+              fi
+              NEW_ID="${PARENT_BUNDLE}.${SUFFIX}"
+              echo "Updating $PLIST_PATH: $CURRENT_ID -> $NEW_ID"
+              /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $NEW_ID" "$PLIST_PATH" || \
+                /usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string $NEW_ID" "$PLIST_PATH" || true
+            else
+              echo "Skipping $PLIST_PATH (does not start with $ORIG_PREFIX): $CURRENT_ID"
+            fi
+          }
+
+          for appex in *.appex; do
+            if [ -d "$appex" ]; then
+              PLIST="$appex/Info.plist"
+              update_plist_id "$PLIST"
+              find "$appex" -type f -name "*.plist" -o -name "*.entitlements" | while read -r f; do
+                /usr/bin/plutil -convert xml1 "$f" >/dev/null 2>&1 || true
+                if grep -q "$ORIG_PREFIX" "$f" >/dev/null 2>&1; then
+                  echo "Replacing occurrences in $f"
+                  perl -0777 -pe "s/\Q${ORIG_PREFIX}\E/${PARENT_BUNDLE}/g" -i "$f" || true
+                fi
+              done
+            fi
+          done
+
+          APP_BUNDLE_DIR="main/Payload/YouTube.app"
+
+          APP_EXTENSIONS_DIR="$APP_BUNDLE_DIR/Extensions"
+          if [ -d "$APP_EXTENSIONS_DIR" ]; then
+            echo "Removing ExtensionKit-style extensions (unresignable):"
+            ls -1 "$APP_EXTENSIONS_DIR" || true
+            rm -rf "$APP_EXTENSIONS_DIR"
+          fi
+
+          find "$APP_BUNDLE_DIR" -depth -type d -name "*AppMigration*" -print0 2>/dev/null \
+            | xargs -0 -I{} sh -c 'echo "Removing {}"; rm -rf "{}"' || true
+
+          if [ -d "$APP_BUNDLE_DIR" ]; then
+            find "$APP_BUNDLE_DIR" -type d -name "*.appex" | while read -r appex; do
+              if [ -d "$appex" ]; then
+                PLIST="$appex/Info.plist"
+                update_plist_id "$PLIST"
+                find "$appex" -type f \( -name "*.plist" -o -name "*.entitlements" \) | while read -r f; do
+                  /usr/bin/plutil -convert xml1 "$f" >/dev/null 2>&1 || true
+                  if grep -q "$ORIG_PREFIX" "$f" >/dev/null 2>&1; then
+                    echo "Replacing occurrences in $f"
+                    perl -0777 -pe "s/\Q${ORIG_PREFIX}\E/${PARENT_BUNDLE}/g" -i "$f" || true
+                  fi
+                done
+              fi
+            done
+          fi
+
+          MAIN_APP_DIR="main/Payload/YouTube.app"
+          if [ -d "$MAIN_APP_DIR" ]; then
+            find "$MAIN_APP_DIR" -type f -name "*.plist" -o -name "*.entitlements" | while read -r f; do
+              /usr/bin/plutil -convert xml1 "$f" >/dev/null 2>&1 || true
+              if grep -q "$ORIG_PREFIX" "$f" >/dev/null 2>&1; then
+                echo "Replacing occurrences in $f"
+                perl -0777 -pe "s/\Q${ORIG_PREFIX}\E/${PARENT_BUNDLE}/g" -i "$f" || true
+              fi
+            done
+          fi
+
+          echo "Normalization complete."
+        shell: bash
+
+      - name: Inject Tweaks Into IPA
+        run: |
+          IPA_IN="main/packages/${{ steps.build_package.outputs.package }}"
+          OUTNAME="uYouEnhanced_${{ env.YT_VERSION }}_v${UYOU_VERSION}.ipa"
+          tweaks="OpenYouTubeSafariExtension.appex"
+          for f in main/packages/*.deb; do
+            [ -f "$f" ] && tweaks="$tweaks $f"
+          done
+          cyan -i "$IPA_IN" -o "$OUTNAME" -uwef $tweaks -n "$APP_NAME" -b "$TARGET_BUNDLE_ID"
+
+      - name: Strip Unresignable Extensions From Final IPA
+        id: strip_ipa
+        run: |
+          set -euo pipefail
+
+          OUTNAME="uYouEnhanced_${{ env.YT_VERSION }}_v${UYOU_VERSION}.ipa"
+          if [ ! -f "$OUTNAME" ]; then
+            OUTNAME="$(basename "$(find . -maxdepth 3 -name 'uYouEnhanced_*.ipa' -print -quit)")"
+          fi
+          echo "Final IPA: $OUTNAME"
+
+          echo "--- .appex bundles contained in final IPA ---"
+          unzip -Z1 "$OUTNAME" | grep '\.appex/' | sed 's|^\(.*\.appex\)/.*|\1|' | sort -u | tee appex_list.txt || true
+
+          BAD="$(grep -v '/PlugIns/' appex_list.txt || true)"
+          if [ -n "$BAD" ]; then
+            echo "Removing unresignable extensions:"
+            printf '%s\n' "$BAD"
+            printf '%s\n' "$BAD" | while IFS= read -r d; do
+              zip -q -d "$OUTNAME" "${d}/*" || true
+            done
+          else
+            echo "All extensions are under PlugIns/ - OK for SideStore."
+          fi
+
+          mkdir -p main/packages
+          cp -f "$OUTNAME" "main/packages/$OUTNAME"
+          find main/packages -maxdepth 1 -name "*.ipa" ! -name "$OUTNAME" -delete || true
+          echo "Final SideStore-compatible IPA: main/packages/$OUTNAME"
+          echo "final_ipa=$OUTNAME" >> "$GITHUB_OUTPUT"
+
+      - name: Register Alternate App Icons
+        run: |
+          set -euo pipefail
+          IPA="main/packages/${{ steps.strip_ipa.outputs.final_ipa }}"
+          rm -rf iconwork && mkdir -p iconwork && cd iconwork
+          unzip -q "../$IPA" "Payload/YouTube.app/Info.plist"
+          PLIST="Payload/YouTube.app/Info.plist"
+          ICON_SRC="../main/Localizations/uYouPlus.bundle/AppIcons"
+          PB=/usr/libexec/PlistBuddy
+          # Create intermediate dicts FIRST (PlistBuddy cannot nest-create).
+          for ROOT in CFBundleIcons "CFBundleIcons~ipad"; do
+            $PB -c "Add :$ROOT dict" "$PLIST" 2>/dev/null || true
+            $PB -c "Add :$ROOT:CFBundleAlternateIcons dict" "$PLIST" 2>/dev/null || true
+          done
+          for f in "$ICON_SRC"/*.png; do
+            NAME="$(basename "$f" .png)"
+            cp -f "$f" "Payload/YouTube.app/$NAME.png"
+            for ROOT in CFBundleIcons "CFBundleIcons~ipad"; do
+              $PB -c "Add :$ROOT:CFBundleAlternateIcons:$NAME dict" "$PLIST" 2>/dev/null || true
+              $PB -c "Add :$ROOT:CFBundleAlternateIcons:$NAME:CFBundleIconFiles array" "$PLIST" 2>/dev/null || true
+              $PB -c "Add :$ROOT:CFBundleAlternateIcons:$NAME:CFBundleIconFiles:0 string $NAME" "$PLIST" 2>/dev/null || true
+              $PB -c "Add :$ROOT:CFBundleAlternateIcons:$NAME:CFBundleIconName string $NAME" "$PLIST" 2>/dev/null || true
+            done
+            echo "Registered alternate icon: $NAME"
+          done
+          $PB -c "Print :CFBundleIcons:CFBundleAlternateIcons" "$PLIST" | sed -n '1,20p'
+          zip -q "../$IPA" "$PLIST" Payload/YouTube.app/*.png
+          cd .. && rm -rf iconwork
+          echo "Alternate icons registered into $(basename "$IPA")"
+
+      - name: Rebrand IPA Filename (3.0.4 -> 3.0.5)
+        run: |
+          set -euo pipefail
+          cd main/packages
+          OLD="${{ steps.strip_ipa.outputs.final_ipa }}"
+          NEW="${OLD//3.0.4/3.0.5}"
+          if [ "$OLD" != "$NEW" ] && [ -f "$OLD" ]; then
+            mv "$OLD" "$NEW"
+            echo "Renamed: $OLD -> $NEW"
+          else
+            echo "No 3.0.4 in filename or file missing: $OLD"
+          fi
+          echo "RENAMED_IPA=$NEW" >> "$GITHUB_ENV"
+
+      - name: Verify final IPA identity and injected iSponsorBlock
+        run: |
+          SPONSOR_MODE=disabled
+          if [ "$SPONSORBLOCK_ENABLED" = "1" ]; then SPONSOR_MODE=enabled; fi
+          mkdir -p deliverables
+          IPA="main/packages/$RENAMED_IPA"
+          python3 main/Scripts/ipa_preflight.py "$IPA" --mode final \
+            --expected-version "$EXPECTED_YOUTUBE_VERSION" --max-ios 18.5 \
+            --expected-bundle-id "$TARGET_BUNDLE_ID" --sponsorblock "$SPONSOR_MODE" \
+            --require-dylib YouMute.dylib --require-dylib YTHoldForSpeed.dylib \
+            --manifest deliverables/ipa-manifest.json
+          cp "$IPA" deliverables/
+          shasum -a 256 "deliverables/$RENAMED_IPA" > deliverables/SHA256SUMS.txt
+          git -C main rev-parse HEAD > deliverables/source-commit.txt
+          git -C main submodule status --recursive > deliverables/submodules.txt
+          printf 'YouTube: %s\nBundle ID: %s\niSponsorBlock: %s\nIPA validation: passed\nDevice testing: still required\n' "$EXPECTED_YOUTUBE_VERSION" "$TARGET_BUNDLE_ID" "$SPONSOR_MODE" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload Artifact
         if: ${{ inputs.upload_artifact }}
-        uses: actions/upload-artifact@v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         env:
           UYOU_VERSION: ${{ inputs.uyou_version }}
           YOUTUBE_VERSION: ${{ steps.prepare_youtube.outputs.youtube_version }}
         with:
           name: uYouEnhanced_${{ env.YOUTUBE_VERSION }}_${{ env.UYOU_VERSION }}
-          path: ${{ github.workspace }}/main/packages/${{ steps.build_package.outputs.package }}
+          path: ${{ github.workspace }}/deliverables/
+          retention-days: 7
           if-no-files-found: error
 
       - name: Create Release
         if: ${{ inputs.create_release }}
         id: create_release
-        uses: softprops/action-gh-release@v2.2.1
+        uses: softprops/action-gh-release@v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           UYOU_VERSION: ${{ inputs.uyou_version }}
@@ -179,3 +455,9 @@ jobs:
           name: v${{ env.YOUTUBE_VERSION }}-${{ env.UYOU_VERSION }}-(${{ github.run_number }})
           files: main/packages/*.ipa
           draft: true
+
+      - name: Remove source download and extracted application from runner
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/youtube-source.ipa" "$RUNNER_TEMP/youtube-build-input.ipa" "$RUNNER_TEMP/input-manifest.json"
+          rm -rf -- "$GITHUB_WORKSPACE/main/Payload" "$RUNNER_TEMP/youtube-input"
